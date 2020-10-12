@@ -6,7 +6,7 @@ import torch
 from .node import Argument
 from .graph import Graph
 from .graph_module import GraphModule
-from .proxy import Proxy, _create_proxy, TracerBase
+from .proxy import TracerBase
 
 HAS_VARSTUFF = inspect.CO_VARARGS | inspect.CO_VARKEYWORDS
 
@@ -119,6 +119,11 @@ class Tracer(TracerBase):
         """
         return m.__module__.startswith('torch.nn') and not isinstance(m, torch.nn.Sequential)
 
+    def call_module(self, m: torch.nn.Module, module_qualified_name: str, forward: callable, args, kwargs):
+        if not self.is_leaf_module(m, module_qualified_name):
+            return forward(*args, **kwargs)
+        return self.create_proxy('call_module', module_qualified_name, args, kwargs)
+
     def trace(self, root: torch.nn.Module) -> Graph:
         self.root = root
         fn = type(root).forward
@@ -131,27 +136,30 @@ class Tracer(TracerBase):
         next(names_iter)  # skip self
         args : List[Any] = [root]
 
-        def make_proxy_placeholder():
-            name = next(names_iter)
-            return self._proxy_placeholder(name, fn.__annotations__.get(name, None))
-        args.extend(make_proxy_placeholder() for _ in range(1, total_args))
+        def proxy_placeholder(name: str):
+            return self.create_proxy('placeholder', name, (), {},
+                                     type_expr=fn.__annotations__.get(name, None))
+
+        args.extend(proxy_placeholder(next(names_iter)) for _ in range(1, total_args))
 
         if co.co_kwonlyargcount > 0 or co.co_flags & HAS_VARSTUFF:
             # TODO: type annotations for *args and **kwargs
             if co.co_flags & inspect.CO_VARARGS:
-                args.append(self._proxy_placeholder('*' + next(names_iter)))
+                args.append(proxy_placeholder('*' + next(names_iter)))
             if co.co_flags & inspect.CO_VARKEYWORDS:
-                args.append(self._proxy_placeholder('**' + next(names_iter)))
+                args.append(proxy_placeholder('**' + next(names_iter)))
             fn = _patch_function(fn, len(args))
 
         orig_call = torch.nn.Module.__call__
 
         def module_call_wrapper(mod, *args, **kwargs):
             module_qualified_name = _find_module(root, mod)
-            if not self.is_leaf_module(mod, module_qualified_name):
+
+            def forward(*args, **kwargs):
                 return orig_call(mod, *args, **kwargs)
-            else:
-                return _create_proxy(self, 'call_module', module_qualified_name, args, kwargs)
+
+            return self.call_module(mod, module_qualified_name, forward, args, kwargs)
+
         try:
             torch.nn.Module.__call__ = module_call_wrapper
             self.create_node('output', 'output', (self.create_arg(fn(*args)),), {},
@@ -159,9 +167,6 @@ class Tracer(TracerBase):
         finally:
             torch.nn.Module.__call__ = orig_call
         return self.graph
-
-    def _proxy_placeholder(self, name: str, type_expr: Optional[Any] = None) -> Proxy:
-        return Proxy(self.create_node('placeholder', name, (), {}, type_expr=type_expr), self)
 
 # Symbolic tracing API
 #
